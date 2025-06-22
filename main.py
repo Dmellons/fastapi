@@ -11,7 +11,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, HT
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field, EmailStr, validator
+from pydantic import BaseModel, Field, EmailStr, validator, field_validator
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from wakeonlan import send_magic_packet
@@ -74,7 +74,8 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     password: str = Field(..., min_length=settings.MIN_PASSWORD_LENGTH)
     
-    @validator('password')
+    @field_validator('password')
+    @classmethod
     def validate_password(cls, v):
         if not any(char.isdigit() for char in v):
             raise ValueError('Password must contain at least one digit')
@@ -100,10 +101,11 @@ class TokenData(BaseModel):
     username: Optional[str] = None
     scopes: List[str] = []
 
+
 class Computer(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    mac_address: Optional[str] = Field(None, regex="^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
-    ip: Optional[str] = Field(None, regex="^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
+    mac_address: Optional[str] = Field(None, pattern="^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+    ip: Optional[str] = Field(None, pattern="^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
     description: Optional[str] = None
     last_wake: Optional[datetime] = None
 
