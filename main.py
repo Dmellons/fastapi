@@ -50,7 +50,11 @@ class Settings:
         "http://localhost:3000",
         "http://localhost:8080",
         "http://localhost:8000",
-        "https://*.davidmellons.com"
+        # "https://*.davidmellons.com",
+        "http://watchlist.davidmellons.com",
+        "https://watchlist.davidmellons.com",
+        "http://data.davidmellons.com",
+        "https://data.davidmellons.com",
     ]
     
     # Security settings
@@ -152,7 +156,13 @@ app.add_middleware(
 
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*.davidmellons.com", "localhost", "127.0.0.1"]
+    allowed_hosts=[
+        "*.davidmellons.com",
+        "localhost",
+        "127.0.0.1",
+        "192.168.0.8",
+        "data.davidmellons.com",
+        "watchlist.davidmellons.com"]
 )
 
 # Exception handlers
@@ -530,10 +540,11 @@ if config("ENV", default="production") == "development":
 
 if __name__ == "__main__":
     # Configure uvicorn for production use
+    log_level = config("LOG_LEVEL", default="info").split()[0].strip()  # Take only the first word
     uvicorn.run(
         "main:app",
-        host=config("HOST", default="0.0.0.0"),
+        host=config("HOST", default="0.0.0.0", cast=str),
         port=int(config("PORT", default=8000)),
-        log_level=config("LOG_LEVEL", default="info"),
+        log_level=log_level,
         reload=config("ENV", default="production") == "development"
     )
