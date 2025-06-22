@@ -1,3 +1,16 @@
+import os
+import locale
+
+# Ensure UTF-8 encoding
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+# Set locale if needed (optional)
+try:
+    locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+except locale.Error:
+    # Fallback if locale is not available
+    pass
+
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.id import ID

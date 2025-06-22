@@ -5,6 +5,9 @@ from typing import List, Optional, Union, Annotated
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
+# Ensure UTF-8 encoding
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, status, Request, Security
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, HTTPBearer, HTTPAuthorizationCredentials
@@ -423,7 +426,7 @@ allowed_ips = [
     "::1",
 ]
 
-# Home Assistant Wake-on-LAN endpoint (IP-based authentication)
+# Home Assistant Wake-on-LAN endpoint (IP-based authentication) - FIXED VERSION
 @app.post("/network/wol/{computer_name}", response_model=WOLResponse, tags=["Network"])
 async def send_wol_ha(computer_name: str, request: Request):
     """
@@ -482,8 +485,13 @@ async def send_wol_ha(computer_name: str, request: Request):
         # Send WOL packet
         send_magic_packet(clean_mac)
         
-        # Log the wake action
-        print(f"Client ({client_ip}) sent WOL to {computer_name} (MAC: {clean_mac})")
+        # Log the wake action with safe encoding
+        try:
+            print(f"Client ({client_ip}) sent WOL to {computer_name} (MAC: {clean_mac})")
+        except UnicodeEncodeError:
+            # Fallback for any encoding issues in logging
+            safe_computer_name = computer_name.encode('ascii', 'replace').decode('ascii')
+            print(f"Client ({client_ip}) sent WOL to {safe_computer_name} (MAC: {clean_mac})")
         
         # Return response with clean ASCII strings
         return WOLResponse(
@@ -495,8 +503,15 @@ async def send_wol_ha(computer_name: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        error_msg = str(e).encode('ascii', 'replace').decode('ascii')
-        print(f"Error sending WOL to {computer_name}: {error_msg}")
+        # Better error handling with safe encoding
+        try:
+            error_msg = str(e)
+            safe_computer_name = computer_name
+        except UnicodeEncodeError:
+            error_msg = repr(e)  # Use repr to avoid encoding issues
+            safe_computer_name = computer_name.encode('ascii', 'replace').decode('ascii')
+        
+        print(f"Error sending WOL to {safe_computer_name}: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to send Wake-on-LAN packet"
@@ -618,6 +633,53 @@ async def list_computers(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve computer list"
         )
+
+# Debug endpoint for troubleshooting encoding issues
+@app.get("/debug/computer/{computer_name}", tags=["Debug"])
+async def debug_computer_data(computer_name: str):
+    """Debug endpoint to inspect computer data encoding"""
+    try:
+        query_result = databases.list_documents(
+            database_id=settings.APPWRITE_PROJECT_ID,
+            collection_id=settings.APPWRITE_COMPUTER_DATABASE_ID,
+            queries=[Query.equal('name', computer_name)]
+        )
+        
+        if not query_result['documents']:
+            return {"error": "Computer not found"}
+        
+        computer = query_result['documents'][0]
+        
+        # Debug each field
+        debug_info = {}
+        for key, value in computer.items():
+            try:
+                # Check if value can be encoded as ASCII
+                str(value).encode('ascii')
+                debug_info[key] = {
+                    "value": value,
+                    "type": type(value).__name__,
+                    "ascii_safe": True
+                }
+            except UnicodeEncodeError as e:
+                debug_info[key] = {
+                    "value": repr(value),  # Use repr to show the actual characters
+                    "type": type(value).__name__,
+                    "ascii_safe": False,
+                    "error": str(e)
+                }
+        
+        return {
+            "computer_name": computer_name,
+            "debug_info": debug_info,
+            "raw_document": computer
+        }
+        
+    except Exception as e:
+        return {
+            "error": f"Debug failed: {repr(e)}",
+            "computer_name": computer_name
+        }
 
 # Test endpoints (only in development)
 if config("ENV", default="production") == "development":
