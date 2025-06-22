@@ -414,7 +414,95 @@ async def read_users_me(
     """Get current user information."""
     return current_user
 
-# Network endpoints
+# Define allowed IPs globally
+allowed_ips = [
+    "192.168.0.45", 
+    "192.168.0.19", 
+    "192.168.0.9", 
+    "127.0.0.1",
+    "::1",
+]
+
+# Home Assistant Wake-on-LAN endpoint (IP-based authentication)
+@app.post("/network/wol/{computer_name}", response_model=WOLResponse, tags=["Network"])
+async def send_wol_ha(computer_name: str, request: Request):
+    """
+    WOL endpoint that only accepts requests from Home Assistant IP.
+    Send Wake-on-LAN magic packet to a computer by name.
+    
+    - **computer_name**: The name of the computer to wake up
+    - Only accepts requests from trusted IPs (Home Assistant)
+    """
+    
+    client_ip = request.client.host
+    
+    if client_ip not in allowed_ips:
+        print(f"Access denied for IP: {client_ip} trying to wake {computer_name}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied for IP: {client_ip}"
+        )
+    
+    try:
+        # Ensure computer_name is clean ASCII
+        computer_name = str(computer_name).strip()
+        
+        # Query for specific computer
+        query_result = databases.list_documents(
+            database_id=settings.APPWRITE_PROJECT_ID,
+            collection_id=settings.APPWRITE_COMPUTER_DATABASE_ID,
+            queries=[Query.equal('name', computer_name)]
+        )
+        
+        if not query_result['documents']:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Computer '{computer_name}' not found"
+            )
+        
+        computer = query_result['documents'][0]
+        mac_address = computer.get('mac_address')
+        
+        if not mac_address:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Computer '{computer_name}' has no MAC address configured"
+            )
+        
+        # Validate and clean MAC address - ensure it's ASCII
+        mac_address = str(mac_address).strip()
+        clean_mac = mac_address.replace(':', '').replace('-', '').replace(' ', '').upper()
+        
+        if len(clean_mac) != 12 or not all(c in '0123456789ABCDEF' for c in clean_mac):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid MAC address format for computer '{computer_name}'"
+            )
+        
+        # Send WOL packet
+        send_magic_packet(clean_mac)
+        
+        # Log the wake action
+        print(f"Client ({client_ip}) sent WOL to {computer_name} (MAC: {clean_mac})")
+        
+        # Return response with clean ASCII strings
+        return WOLResponse(
+            success=True,
+            message=f"Wake-on-LAN packet sent successfully to {computer_name}",
+            computer_name=computer_name
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e).encode('ascii', 'replace').decode('ascii')
+        print(f"Error sending WOL to {computer_name}: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send Wake-on-LAN packet"
+        )
+
+# Authenticated Network endpoints
 @app.post(
     f"/api/{settings.API_VERSION}/network/wol", 
     response_model=WOLResponse,
