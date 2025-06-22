@@ -48,16 +48,20 @@ class Settings:
     PLEX_TOKEN: Optional[str] = config('PLEX_TOKEN', default=None)
     PLEX_SERVER_BASE_URL: Optional[str] = config('PLEX_SERVER_BASE_URL', default=None)
     
-    # CORS settings
+    # CORS settings - Load from environment variable
     ALLOWED_ORIGINS: List[str] = [
-        "http://localhost:3000",
-        "http://localhost:8080",
-        "http://localhost:8000",
-        # "https://*.davidmellons.com",
-        "http://watchlist.davidmellons.com",
-        "https://watchlist.davidmellons.com",
-        "http://data.davidmellons.com",
-        "https://data.davidmellons.com",
+        origin.strip() for origin in config(
+            'ALLOWED_ORIGINS', 
+            default="http://localhost:3000,http://localhost:8000"
+        ).split(',')
+    ]
+    
+    # Allowed IPs for Wake-on-LAN - Load from environment variable
+    ALLOWED_IPS: List[str] = [
+        ip.strip() for ip in config(
+            'ALLOWED_IPS', 
+            default="127.0.0.1,::1"
+        ).split(',')
     ]
     
     # Security settings
@@ -70,7 +74,7 @@ settings = Settings()
 # pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", rounds=settings.BCRYPT_ROUNDS)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"/api/{settings.API_VERSION}/auth/token")
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 # Pydantic models with validation
 class UserBase(BaseModel):
@@ -124,6 +128,10 @@ class WOLResponse(BaseModel):
     message: str
     computer_name: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=50)
+    password: str = Field(..., min_length=1)
 
 # Lifespan context manager for startup/shutdown
 @asynccontextmanager
@@ -249,7 +257,7 @@ async def authenticate_user(username: str, password: str) -> Union[UserInDB, boo
         return False
     return user
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)) -> User:
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> User:
     """Get current authenticated user from JWT token."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -259,7 +267,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
     
     try:
         payload = jwt.decode(
-            credentials.credentials, 
+            token, 
             settings.SECRET_KEY, 
             algorithms=[settings.ALGORITHM]
         )
@@ -367,8 +375,42 @@ async def login(request: Request, form_data: Annotated[OAuth2PasswordRequestForm
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
 
+@app.post(f"/api/{settings.API_VERSION}/auth/login", response_model=Token, tags=["Authentication"])
+@rate_limit(calls=5, period=60)
+async def login_json(request: Request, login_data: LoginRequest):
+    """
+    JSON-based login endpoint, get an access token for future requests.
+    
+    Send a JSON body with username and password:
+    {
+        "username": "your-username",
+        "password": "your-password"
+    }
+    """
+    user = await authenticate_user(login_data.username, login_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, 
+        expires_delta=access_token_expires
+    )
+    refresh_token = create_refresh_token(data={"sub": user.username})
+    
+    return Token(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+
 @app.post(f"/api/{settings.API_VERSION}/auth/refresh", response_model=Token, tags=["Authentication"])
-async def refresh_token(credentials: HTTPAuthorizationCredentials = Security(security)):
+async def refresh_token(token: Annotated[str, Depends(oauth2_scheme)]):
     """Refresh access token using refresh token."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -378,7 +420,7 @@ async def refresh_token(credentials: HTTPAuthorizationCredentials = Security(sec
     
     try:
         payload = jwt.decode(
-            credentials.credentials,
+            token,
             settings.SECRET_KEY,
             algorithms=[settings.ALGORITHM]
         )
@@ -417,15 +459,6 @@ async def read_users_me(
     """Get current user information."""
     return current_user
 
-# Define allowed IPs globally
-allowed_ips = [
-    "192.168.0.45", 
-    "192.168.0.19", 
-    "192.168.0.9", 
-    "127.0.0.1",
-    "::1",
-]
-
 # Home Assistant Wake-on-LAN endpoint (IP-based authentication) - FIXED VERSION
 @app.post("/network/wol/{computer_name}", response_model=WOLResponse, tags=["Network"])
 async def send_wol_ha(computer_name: str, request: Request):
@@ -439,7 +472,7 @@ async def send_wol_ha(computer_name: str, request: Request):
     
     client_ip = request.client.host
     
-    if client_ip not in allowed_ips:
+    if client_ip not in settings.ALLOWED_IPS:
         print(f"Access denied for IP: {client_ip} trying to wake {computer_name}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
