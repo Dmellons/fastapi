@@ -60,7 +60,8 @@ class Settings:
 settings = Settings()
 
 # Security setup
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", rounds=settings.BCRYPT_ROUNDS)
+# pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", rounds=settings.BCRYPT_ROUNDS)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"/api/{settings.API_VERSION}/auth/token")
 security = HTTPBearer()
 
