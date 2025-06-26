@@ -2,3 +2,4 @@ __pycache__/
 venv/
 test/
 *.env*
+db_users.py
