@@ -1,9 +1,19 @@
-# main.py - Improved FastAPI Server
+# main.py - Optimized FastAPI Server with Performance Improvements and Subnet Support
 import os
 import json
-from typing import List, Optional, Union, Annotated
+import time
+import asyncio
+import multiprocessing
+import psutil
+import gc
+import threading
+import ipaddress
+from typing import List, Optional, Union, Annotated, Dict, Any
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from collections import defaultdict
+from functools import wraps, lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure UTF-8 encoding
 os.environ['PYTHONIOENCODING'] = 'utf-8'
@@ -70,11 +80,212 @@ class Settings:
 
 settings = Settings()
 
+# IP Subnet Support Function
+def is_ip_allowed(client_ip: str, allowed_ips: List[str]) -> bool:
+    """
+    Check if client IP is allowed. Supports both exact IPs and CIDR notation.
+    
+    Examples:
+    - 192.168.0.19 (exact IP)
+    - 192.168.0.0/24 (subnet)
+    - 10.0.0.0/8 (larger subnet)
+    """
+    try:
+        client_addr = ipaddress.ip_address(client_ip)
+        
+        for allowed in allowed_ips:
+            allowed = allowed.strip()
+            
+            # Check if it's a CIDR notation (contains '/')
+            if '/' in allowed:
+                try:
+                    network = ipaddress.ip_network(allowed, strict=False)
+                    if client_addr in network:
+                        return True
+                except (ipaddress.AddressValueError, ipaddress.NetmaskValueError):
+                    # If CIDR parsing fails, treat as exact IP
+                    if str(client_addr) == allowed:
+                        return True
+            else:
+                # Exact IP match
+                if str(client_addr) == allowed:
+                    return True
+                    
+        return False
+        
+    except ipaddress.AddressValueError:
+        # If client_ip is not a valid IP, fall back to exact string matching
+        return client_ip in allowed_ips
+
+# Production settings
+class ProductionSettings:
+    @staticmethod
+    def get_worker_count():
+        cpu_count = multiprocessing.cpu_count()
+        return min(cpu_count, 8)  # Cap at 8 workers for memory usage
+    
+    WORKERS = get_worker_count()
+    WORKER_CONNECTIONS = 1000
+    BACKLOG = 2048
+    KEEPALIVE = 2
+
+# Thread pool for CPU-bound operations
+thread_pool = ThreadPoolExecutor(max_workers=4)
+
 # Security setup
-# pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", rounds=settings.BCRYPT_ROUNDS)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"/api/{settings.API_VERSION}/auth/token")
 security = HTTPBearer(auto_error=False)
+
+# Efficient Rate Limiter
+class EfficientRateLimiter:
+    def __init__(self):
+        self.storage = defaultdict(list)
+        self.last_cleanup = time.time()
+        self.cleanup_interval = 300  # Clean up every 5 minutes
+    
+    def cleanup_old_entries(self):
+        """Periodic cleanup instead of per-request cleanup"""
+        now = time.time()
+        if now - self.last_cleanup > self.cleanup_interval:
+            # Remove IPs with no recent requests
+            to_remove = []
+            for ip, timestamps in self.storage.items():
+                # Keep only recent timestamps
+                recent = [t for t in timestamps if now - t < 3600]  # Keep 1 hour
+                if recent:
+                    self.storage[ip] = recent
+                else:
+                    to_remove.append(ip)
+            
+            for ip in to_remove:
+                del self.storage[ip]
+            
+            self.last_cleanup = now
+    
+    def is_allowed(self, client_ip: str, calls: int, period: int) -> bool:
+        now = time.time()
+        
+        # Efficient cleanup only when needed
+        if len(self.storage) > 1000:  # Only cleanup when storage gets large
+            self.cleanup_old_entries()
+        
+        # Get recent requests for this IP
+        timestamps = self.storage[client_ip]
+        
+        # Count recent requests (more efficient than list comprehension)
+        recent_count = sum(1 for t in timestamps if now - t < period)
+        
+        if recent_count >= calls:
+            return False
+        
+        # Add current request
+        timestamps.append(now)
+        
+        # Keep only recent requests for this IP (limit per-IP storage)
+        if len(timestamps) > calls * 2:  # Keep some buffer
+            timestamps[:] = [t for t in timestamps if now - t < period]
+        
+        return True
+
+# Global rate limiter instance
+rate_limiter = EfficientRateLimiter()
+
+# Database Manager with Caching
+class DatabaseManager:
+    def __init__(self):
+        self.client = client
+        self.databases = databases
+        
+        # Add simple caching for computer data
+        self._computer_cache = {}
+        self._cache_ttl = 300  # 5 minutes
+        
+    async def get_computer_cached(self, computer_name: str):
+        """Get computer data with caching."""
+        now = time.time()
+        cache_key = f"computer:{computer_name}"
+        
+        # Check cache first
+        if cache_key in self._computer_cache:
+            cached_data, cached_time = self._computer_cache[cache_key]
+            if now - cached_time < self._cache_ttl:
+                return cached_data
+        
+        # Query database in thread pool
+        loop = asyncio.get_event_loop()
+        
+        try:
+            query_result = await loop.run_in_executor(
+                thread_pool,
+                lambda: self.databases.list_documents(
+                    database_id=settings.APPWRITE_PROJECT_ID,
+                    collection_id=settings.APPWRITE_COMPUTER_DATABASE_ID,
+                    queries=[Query.equal('name', computer_name)]
+                )
+            )
+            
+            # Cache the result
+            self._computer_cache[cache_key] = (query_result, now)
+            
+            # Clean old cache entries periodically
+            if len(self._computer_cache) > 100:
+                self._clean_cache()
+            
+            return query_result
+            
+        except Exception as e:
+            print(f"Database query error: {e}")
+            raise
+    
+    async def list_computers_cached(self, skip: int = 0, limit: int = 100):
+        """List computers with caching."""
+        now = time.time()
+        cache_key = f"computers_list:{skip}:{limit}"
+        
+        # Check cache first
+        if cache_key in self._computer_cache:
+            cached_data, cached_time = self._computer_cache[cache_key]
+            if now - cached_time < self._cache_ttl:
+                return cached_data
+        
+        # Query database in thread pool
+        loop = asyncio.get_event_loop()
+        
+        try:
+            query_result = await loop.run_in_executor(
+                thread_pool,
+                lambda: self.databases.list_documents(
+                    database_id=settings.APPWRITE_PROJECT_ID,
+                    collection_id=settings.APPWRITE_COMPUTER_DATABASE_ID,
+                    queries=[
+                        Query.offset(skip),
+                        Query.limit(limit)
+                    ]
+                )
+            )
+            
+            # Cache the result
+            self._computer_cache[cache_key] = (query_result, now)
+            
+            return query_result
+            
+        except Exception as e:
+            print(f"Database query error: {e}")
+            raise
+    
+    def _clean_cache(self):
+        """Remove old cache entries."""
+        now = time.time()
+        to_remove = [
+            key for key, (_, cached_time) in self._computer_cache.items()
+            if now - cached_time > self._cache_ttl
+        ]
+        for key in to_remove:
+            del self._computer_cache[key]
+
+# Create global database manager
+db_manager = DatabaseManager()
 
 # Pydantic models with validation
 class UserBase(BaseModel):
@@ -112,7 +323,6 @@ class TokenData(BaseModel):
     username: Optional[str] = None
     scopes: List[str] = []
 
-
 class Computer(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     mac_address: Optional[str] = Field(None, pattern="^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
@@ -138,11 +348,12 @@ class LoginRequest(BaseModel):
 async def lifespan(app: FastAPI):
     # Startup
     print("Starting up Melston API...")
-    # Add any startup logic here (DB connections, etc.)
+    print(f"Available CPU cores: {multiprocessing.cpu_count()}")
+    print(f"Thread pool workers: {thread_pool._max_workers}")
     yield
     # Shutdown
     print("Shutting down Melston API...")
-    # Add any cleanup logic here
+    thread_pool.shutdown(wait=True)
 
 # Create FastAPI app
 app = FastAPI(
@@ -176,6 +387,23 @@ app.add_middleware(
         "watchlist.davidmellons.com"]
 )
 
+# Request timing middleware
+@app.middleware("http")
+async def track_request_time(request: Request, call_next):
+    """Track request processing time."""
+    start_time = time.time()
+    
+    response = await call_next(request)
+    
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    # Log slow requests
+    if process_time > 1.0:  # Log requests taking more than 1 second
+        print(f"Slow request: {request.method} {request.url.path} took {process_time:.2f}s")
+    
+    return response
+
 # Exception handlers
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -205,7 +433,7 @@ async def general_exception_handler(request: Request, exc: Exception):
         },
     )
 
-# Helper functions
+# Async Helper functions
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash."""
     return pwd_context.verify(plain_password, hashed_password)
@@ -241,21 +469,59 @@ def create_refresh_token(data: dict) -> str:
     })
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
-async def get_user(username: str) -> Optional[UserInDB]:
-    """Retrieve user from database."""
+async def get_user_async(username: str) -> Optional[UserInDB]:
+    """Async version of get_user."""
+    await asyncio.sleep(0)  # Yield control
     if username in db:
         user_dict = db[username]
         return UserInDB(**user_dict)
     return None
 
-async def authenticate_user(username: str, password: str) -> Union[UserInDB, bool]:
-    """Authenticate user with username and password."""
-    user = await get_user(username)
+async def authenticate_user_async(username: str, password: str) -> Union[UserInDB, bool]:
+    """Async version of authenticate_user."""
+    user = await get_user_async(username)
     if not user:
         return False
-    if not verify_password(password, user.hashed_password):
+    
+    # Run password verification in thread pool since it's CPU-intensive
+    loop = asyncio.get_event_loop()
+    is_valid = await loop.run_in_executor(
+        thread_pool, 
+        verify_password, 
+        password, 
+        user.hashed_password
+    )
+    
+    if not is_valid:
         return False
     return user
+
+async def create_tokens_async(username: str) -> dict:
+    """Async token creation."""
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    # Run token creation in thread pool since JWT operations can be CPU-intensive
+    loop = asyncio.get_event_loop()
+    
+    access_token = await loop.run_in_executor(
+        thread_pool,
+        create_access_token,
+        {"sub": username},
+        access_token_expires
+    )
+    
+    refresh_token = await loop.run_in_executor(
+        thread_pool,
+        create_refresh_token,
+        {"sub": username}
+    )
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    }
 
 async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> User:
     """Get current authenticated user from JWT token."""
@@ -282,7 +548,7 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> Use
     except JWTError:
         raise credentials_exception
         
-    user = await get_user(username=token_data.username)
+    user = await get_user_async(username=token_data.username)
     if user is None:
         raise credentials_exception
         
@@ -296,34 +562,20 @@ async def get_current_active_user(
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
 
-# Rate limiting decorator (simple in-memory implementation)
-from functools import wraps
-from collections import defaultdict
-import time
-
-rate_limit_storage = defaultdict(list)
-
+# Rate limiting decorator
 def rate_limit(calls: int = 10, period: int = 60):
-    """Simple rate limiting decorator."""
+    """Efficient rate limiting decorator."""
     def decorator(func):
         @wraps(func)
         async def wrapper(request: Request, *args, **kwargs):
             client_ip = request.client.host
-            now = time.time()
             
-            # Clean old entries
-            rate_limit_storage[client_ip] = [
-                timestamp for timestamp in rate_limit_storage[client_ip]
-                if now - timestamp < period
-            ]
-            
-            if len(rate_limit_storage[client_ip]) >= calls:
+            if not rate_limiter.is_allowed(client_ip, calls, period):
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail="Rate limit exceeded"
                 )
             
-            rate_limit_storage[client_ip].append(now)
             return await func(request, *args, **kwargs)
         return wrapper
     return decorator
@@ -346,6 +598,75 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
+# Monitoring endpoints
+@app.get(f"/api/{settings.API_VERSION}/monitoring/system", tags=["Monitoring"])
+async def system_metrics():
+    """Get system resource usage."""
+    try:
+        # Get CPU usage
+        cpu_percent = psutil.cpu_percent(interval=0.1)  # Non-blocking
+        
+        # Get memory usage
+        memory = psutil.virtual_memory()
+        
+        # Get process-specific info
+        process = psutil.Process()
+        process_memory = process.memory_info()
+        
+        return {
+            "cpu": {
+                "usage_percent": cpu_percent,
+                "count": psutil.cpu_count(),
+                "load_avg": psutil.getloadavg() if hasattr(psutil, 'getloadavg') else None
+            },
+            "memory": {
+                "total": memory.total,
+                "available": memory.available,
+                "used": memory.used,
+                "percent": memory.percent
+            },
+            "process": {
+                "memory_rss": process_memory.rss,
+                "memory_vms": process_memory.vms,
+                "cpu_percent": process.cpu_percent(),
+                "num_threads": process.num_threads(),
+                "connections": len(process.connections()) if hasattr(process, 'connections') else 0
+            },
+            "rate_limiter": {
+                "active_ips": len(rate_limiter.storage),
+                "total_requests": sum(len(timestamps) for timestamps in rate_limiter.storage.values())
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get(f"/api/{settings.API_VERSION}/monitoring/performance", tags=["Monitoring"])
+async def performance_metrics():
+    """Get performance-related metrics."""
+    try:
+        # Garbage collection stats
+        gc_stats = gc.get_stats()
+        
+        # Thread information
+        thread_count = threading.active_count()
+        
+        return {
+            "garbage_collection": gc_stats,
+            "threads": {
+                "active_count": thread_count,
+                "main_thread_alive": threading.main_thread().is_alive(),
+                "thread_pool_workers": thread_pool._max_workers
+            },
+            "asyncio": {
+                "loop_running": True  # If we get here, the loop is running
+            },
+            "database_cache": {
+                "cached_items": len(db_manager._computer_cache)
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 # Authentication endpoints
 @app.post(f"/api/{settings.API_VERSION}/auth/token", response_model=Token, tags=["Authentication"])
 @rate_limit(calls=5, period=60)
@@ -353,7 +674,7 @@ async def login(request: Request, form_data: Annotated[OAuth2PasswordRequestForm
     """
     OAuth2 compatible token login, get an access token for future requests.
     """
-    user = await authenticate_user(form_data.username, form_data.password)
+    user = await authenticate_user_async(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -361,33 +682,16 @@ async def login(request: Request, form_data: Annotated[OAuth2PasswordRequestForm
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, 
-        expires_delta=access_token_expires
-    )
-    refresh_token = create_refresh_token(data={"sub": user.username})
-    
-    return Token(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        token_type="bearer",
-        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    )
+    tokens = await create_tokens_async(user.username)
+    return Token(**tokens)
 
 @app.post(f"/api/{settings.API_VERSION}/auth/login", response_model=Token, tags=["Authentication"])
 @rate_limit(calls=5, period=60)
 async def login_json(request: Request, login_data: LoginRequest):
     """
     JSON-based login endpoint, get an access token for future requests.
-    
-    Send a JSON body with username and password:
-    {
-        "username": "your-username",
-        "password": "your-password"
-    }
     """
-    user = await authenticate_user(login_data.username, login_data.password)
+    user = await authenticate_user_async(login_data.username, login_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -395,19 +699,8 @@ async def login_json(request: Request, login_data: LoginRequest):
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, 
-        expires_delta=access_token_expires
-    )
-    refresh_token = create_refresh_token(data={"sub": user.username})
-    
-    return Token(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        token_type="bearer",
-        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    )
+    tokens = await create_tokens_async(user.username)
+    return Token(**tokens)
 
 @app.post(f"/api/{settings.API_VERSION}/auth/refresh", response_model=Token, tags=["Authentication"])
 async def refresh_token(token: Annotated[str, Depends(oauth2_scheme)]):
@@ -434,22 +727,13 @@ async def refresh_token(token: Annotated[str, Depends(oauth2_scheme)]):
         raise credentials_exception
     
     # Verify user still exists and is active
-    user = await get_user(username)
+    user = await get_user_async(username)
     if not user or user.disabled:
         raise credentials_exception
     
     # Create new access token
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": username},
-        expires_delta=access_token_expires
-    )
-    
-    return Token(
-        access_token=access_token,
-        token_type="bearer",
-        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    )
+    tokens = await create_tokens_async(username)
+    return Token(**tokens)
 
 # User endpoints
 @app.get(f"/api/{settings.API_VERSION}/users/me", response_model=User, tags=["Users"])
@@ -459,20 +743,18 @@ async def read_users_me(
     """Get current user information."""
     return current_user
 
-# Home Assistant Wake-on-LAN endpoint (IP-based authentication) - FIXED VERSION
+# Home Assistant Wake-on-LAN endpoint (IP-based authentication) - OPTIMIZED WITH SUBNET SUPPORT
 @app.post("/network/wol/{computer_name}", response_model=WOLResponse, tags=["Network"])
 async def send_wol_ha(computer_name: str, request: Request):
     """
-    WOL endpoint that only accepts requests from Home Assistant IP.
-    Send Wake-on-LAN magic packet to a computer by name.
-    
-    - **computer_name**: The name of the computer to wake up
-    - Only accepts requests from trusted IPs (Home Assistant)
+    Optimized WOL endpoint for Home Assistant with subnet support.
+    Supports both exact IPs and CIDR notation (e.g., 192.168.0.0/24).
     """
     
     client_ip = request.client.host
     
-    if client_ip not in settings.ALLOWED_IPS:
+    # Use the new subnet-aware IP checking
+    if not is_ip_allowed(client_ip, settings.ALLOWED_IPS):
         print(f"Access denied for IP: {client_ip} trying to wake {computer_name}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -483,12 +765,8 @@ async def send_wol_ha(computer_name: str, request: Request):
         # Ensure computer_name is clean ASCII
         computer_name = str(computer_name).strip()
         
-        # Query for specific computer
-        query_result = databases.list_documents(
-            database_id=settings.APPWRITE_PROJECT_ID,
-            collection_id=settings.APPWRITE_COMPUTER_DATABASE_ID,
-            queries=[Query.equal('name', computer_name)]
-        )
+        # Use cached database query
+        query_result = await db_manager.get_computer_cached(computer_name)
         
         if not query_result['documents']:
             raise HTTPException(
@@ -515,8 +793,9 @@ async def send_wol_ha(computer_name: str, request: Request):
                 detail=f"Invalid MAC address format for computer '{computer_name}'"
             )
         
-        # Send WOL packet
-        send_magic_packet(clean_mac)
+        # Send WOL packet in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(thread_pool, send_magic_packet, clean_mac)
         
         # Log the wake action with safe encoding
         try:
@@ -563,17 +842,10 @@ async def send_wol(
 ):
     """
     Send Wake-on-LAN magic packet to a computer by name.
-    
-    - **computer_name**: The name of the computer to wake up
-    - Requires authentication
     """
     try:
-        # Query for specific computer
-        query_result = databases.list_documents(
-            database_id=settings.APPWRITE_PROJECT_ID,
-            collection_id=settings.APPWRITE_COMPUTER_DATABASE_ID,
-            queries=[Query.equal('name', wol_request.computer_name)]
-        )
+        # Use cached database query
+        query_result = await db_manager.get_computer_cached(wol_request.computer_name)
         
         if not query_result['documents']:
             raise HTTPException(
@@ -599,10 +871,11 @@ async def send_wol(
                 detail=f"Invalid MAC address format for computer '{wol_request.computer_name}'"
             )
         
-        # Send WOL packet
-        send_magic_packet(clean_mac)
+        # Send WOL packet in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(thread_pool, send_magic_packet, clean_mac)
         
-        # Log the wake action (you might want to update the database here)
+        # Log the wake action
         print(f"User {current_user.username} sent WOL to {wol_request.computer_name}")
         
         return WOLResponse(
@@ -633,20 +906,9 @@ async def list_computers(
 ):
     """
     List all available computers for Wake-on-LAN.
-    
-    - **skip**: Number of records to skip (pagination)
-    - **limit**: Maximum number of records to return
-    - Requires authentication
     """
     try:
-        query_result = databases.list_documents(
-            database_id=settings.APPWRITE_PROJECT_ID,
-            collection_id=settings.APPWRITE_COMPUTER_DATABASE_ID,
-            queries=[
-                Query.offset(skip),
-                Query.limit(limit)
-            ]
-        )
+        query_result = await db_manager.list_computers_cached(skip=skip, limit=limit)
         
         computers = []
         for doc in query_result['documents']:
@@ -672,11 +934,7 @@ async def list_computers(
 async def debug_computer_data(computer_name: str):
     """Debug endpoint to inspect computer data encoding"""
     try:
-        query_result = databases.list_documents(
-            database_id=settings.APPWRITE_PROJECT_ID,
-            collection_id=settings.APPWRITE_COMPUTER_DATABASE_ID,
-            queries=[Query.equal('name', computer_name)]
-        )
+        query_result = await db_manager.get_computer_cached(computer_name)
         
         if not query_result['documents']:
             return {"error": "Computer not found"}
@@ -722,12 +980,31 @@ if config("ENV", default="production") == "development":
         return {"message": "Test successful", "environment": "development"}
 
 if __name__ == "__main__":
-    # Configure uvicorn for production use
-    log_level = config("LOG_LEVEL", default="info").split()[0].strip()  # Take only the first word
-    uvicorn.run(
-        "main:app",
-        host=config("HOST", default="0.0.0.0", cast=str),
-        port=int(config("PORT", default=8000)),
-        log_level=log_level,
-        reload=config("ENV", default="production") == "development"
-    )
+    # Production configuration
+    workers = ProductionSettings.get_worker_count()
+    
+    # Use gunicorn for production (recommended)
+    if config("ENV", default="production") == "production":
+        print(f"Starting FastAPI with {workers} workers")
+        print("For production, consider using gunicorn:")
+        print(f"gunicorn main:app -w {workers} -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:5000 --worker-connections 1000 --backlog 2048")
+        
+        uvicorn.run(
+            "main:app",
+            host=config("HOST", default="0.0.0.0"),
+            port=int(config("PORT", default=5000)),
+            workers=1,  # Use 1 for uvicorn, use gunicorn for multiple workers
+            log_level=config("LOG_LEVEL", default="info"),
+            worker_connections=ProductionSettings.WORKER_CONNECTIONS,
+            backlog=ProductionSettings.BACKLOG,
+            reload=False
+        )
+    else:
+        # Development mode
+        uvicorn.run(
+            "main:app",
+            host=config("HOST", default="127.0.0.1"),
+            port=int(config("PORT", default=5000)),
+            log_level="debug",
+            reload=True
+        )
